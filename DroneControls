@@ -1,3 +1,4 @@
+'''python
 from ultralytics import YOLO
 from pymavlink import mavutil
 import cv2
@@ -467,3 +468,4 @@ if __name__ == '__main__':
             loiter(master)
         except Exception:
             pass
+'''
