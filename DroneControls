@@ -1,1 +1,469 @@
+from ultralytics import YOLO
+from pymavlink import mavutil
+import cv2
+import time
+import traceback
 
+def connect_to_drone(connection_string):
+    try:
+        master = mavutil.mavlink_connection(connection_string, baud=57600)
+        master.wait_heartbeat(timeout=30)
+        return master
+    except Exception as e:
+        raise
+
+def arm_and_takeoff(master, altitude=3):
+    try:
+        master.arducopter_arm()
+        time.sleep(1)
+    except Exception as err:
+        return False
+
+    try:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0,
+            0, 0, 0, 0, 0, 0, altitude
+        )
+        time.sleep(8)
+        return True
+    except Exception as e:
+        return False
+
+def set_drone_mode(master, mode):
+    mode_id = master.mode_mapping().get(mode)
+    if mode_id is None:
+        return False
+    try:
+        master.set_mode(mode_id)
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=2)
+            if ack_msg and ack_msg.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+                return True
+        return False
+    except Exception as e:
+        return False
+
+def autonomous_flight(master):
+    movements = [
+        (1500, 1600),
+        (1600, 1500),
+        (1500, 1400),
+        (1400, 1500)
+    ]
+    try:
+        for roll, pitch in movements:
+            master.mav.rc_channels_override_send(
+                master.target_system,
+                master.target_component,
+                roll, pitch, 1500, 1500, 0, 0, 0, 0
+            )
+            time.sleep(3)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1500, 1500, 1500, 1500, 0, 0, 0, 0
+        )
+    except Exception as e:
+        set_drone_mode(master, 'LOITER')
+
+def is_camera_accessible(stream_url):
+    cap = cv2.VideoCapture(stream_url)
+    ret, frame = cap.read()
+    cap.release()
+    return ret
+
+def loiter(master):
+    set_drone_mode(master, 'LOITER')
+
+def simple_up_down(master, altitude=2, duration=10):
+    try:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0,
+            0, 0, 0, 0, 0, 0, altitude
+        )
+        time.sleep(8)
+        set_drone_mode(master, 'LOITER')
+        time.sleep(duration)
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_LAND,
+            0,
+            0, 0, 0, 0, 0, 0, 0
+        )
+        time.sleep(8)
+    except Exception as e:
+        loiter(master)
+
+def esc_calibration(master):
+    try:
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            2000, 2000, 2000, 2000, 0, 0, 0, 0
+        )
+        time.sleep(5)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1000, 1000, 1000, 1000, 0, 0, 0, 0
+        )
+        time.sleep(5)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1500, 1500, 1500, 1500, 0, 0, 0, 0
+        )
+    except Exception as e:
+        pass
+
+def total_esc_calibration(master, auto_proceed=True):
+    try:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+            0,
+            0, 0, 0, 0, 0, 1, 0
+        )
+        if auto_proceed:
+            time.sleep(10)
+        else:
+            input("Disconnect the battery, wait 5-10 seconds, reconnect, then press Enter...")
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            2000, 2000, 2000, 2000, 0, 0, 0, 0
+        )
+        time.sleep(6)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1000, 1000, 1000, 1000, 0, 0, 0, 0
+        )
+        time.sleep(6)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1500, 1500, 1500, 1500, 0, 0, 0, 0
+        )
+    except Exception as e:
+        pass
+
+def detect_and_align(master, model, stream_url):
+    cap = cv2.VideoCapture(stream_url)
+    reconnect_attempts = 0
+
+    while cap.isOpened():
+        try:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                reconnect_attempts += 1
+                if reconnect_attempts > 3:
+                    loiter(master)
+                    break
+                time.sleep(1)
+                continue
+
+            reconnect_attempts = 0
+            try:
+                results = model.predict(source=frame, conf=0.7)
+                boxes = results[0].boxes
+                if boxes is None or boxes.xyxy.cpu().numpy().size == 0:
+                    continue
+            except Exception as e:
+                loiter(master)
+                break
+
+            frame_center = (frame.shape[1] // 2, frame.shape[0] // 2)
+            for box in boxes.xyxy.cpu().numpy():
+                obj_center_x = (box[0] + box[2]) / 2
+                obj_center_y = (box[1] + box[3]) / 2
+                offset_x = obj_center_x - frame_center[0]
+                offset_y = obj_center_y - frame_center[1]
+
+                roll = int(1500 + offset_x * 0.1)
+                pitch = int(1500 - offset_y * 0.1)
+
+                if master.target_system and master.target_component:
+                    master.mav.rc_channels_override_send(
+                        master.target_system,
+                        master.target_component,
+                        roll, pitch, 1500, 1500, 0, 0, 0, 0
+                    )
+                    print(f"Aligning: Roll={roll}, Pitch={pitch}")
+                else:
+                    loiter(master)
+                    break
+
+            cv2.imshow('YOLO Detection and Alignment', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        except Exception as e:
+            loiter(master)
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    connection_string = '/dev/ttyACM0'
+    stream_url = "http://192.168.43.1:81/stream"
+
+    try:
+        master = connect_to_drone(connection_string)
+
+        total_esc_calibration(master, auto_proceed=True)
+
+        model = YOLO('yfrom ultralytics import YOLO
+from pymavlink import mavutil
+import cv2
+import time
+import traceback
+
+def connect_to_drone(connection_string):
+    try:
+        master = mavutil.mavlink_connection(connection_string, baud=57600)
+        master.wait_heartbeat(timeout=30)
+        return master
+    except Exception as e:
+        raise
+
+def arm_and_takeoff(master, altitude=3):
+    try:
+        master.arducopter_arm()
+        time.sleep(1)
+    except Exception as err:
+        return False
+
+    try:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0,
+            0, 0, 0, 0, 0, 0, altitude
+        )
+        time.sleep(8)
+        return True
+    except Exception as e:
+        return False
+
+def set_drone_mode(master, mode):
+    mode_id = master.mode_mapping().get(mode)
+    if mode_id is None:
+        return False
+    try:
+        master.set_mode(mode_id)
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=2)
+            if ack_msg and ack_msg.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+                return True
+        return False
+    except Exception as e:
+        return False
+
+def autonomous_flight(master):
+    movements = [
+        (1500, 1600),
+        (1600, 1500),
+        (1500, 1400),
+        (1400, 1500)
+    ]
+    try:
+        for roll, pitch in movements:
+            master.mav.rc_channels_override_send(
+                master.target_system,
+                master.target_component,
+                roll, pitch, 1500, 1500, 0, 0, 0, 0
+            )
+            time.sleep(3)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1500, 1500, 1500, 1500, 0, 0, 0, 0
+        )
+    except Exception as e:
+        set_drone_mode(master, 'LOITER')
+
+def is_camera_accessible(stream_url):
+    cap = cv2.VideoCapture(stream_url)
+    ret, frame = cap.read()
+    cap.release()
+    return ret
+
+def loiter(master):
+    set_drone_mode(master, 'LOITER')
+
+def simple_up_down(master, altitude=2, duration=10):
+    try:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0,
+            0, 0, 0, 0, 0, 0, altitude
+        )
+        time.sleep(8)
+        set_drone_mode(master, 'LOITER')
+        time.sleep(duration)
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_LAND,
+            0,
+            0, 0, 0, 0, 0, 0, 0
+        )
+        time.sleep(8)
+    except Exception as e:
+        loiter(master)
+
+def esc_calibration(master):
+    try:
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            2000, 2000, 2000, 2000, 0, 0, 0, 0
+        )
+        time.sleep(5)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1000, 1000, 1000, 1000, 0, 0, 0, 0
+        )
+        time.sleep(5)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1500, 1500, 1500, 1500, 0, 0, 0, 0
+        )
+    except Exception as e:
+        pass
+
+def total_esc_calibration(master, auto_proceed=True):
+    try:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+            0,
+            0, 0, 0, 0, 0, 1, 0
+        )
+        if auto_proceed:
+            time.sleep(10)
+        else:
+            input("Disconnect the battery, wait 5-10 seconds, reconnect, then press Enter...")
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            2000, 2000, 2000, 2000, 0, 0, 0, 0
+        )
+        time.sleep(6)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1000, 1000, 1000, 1000, 0, 0, 0, 0
+        )
+        time.sleep(6)
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            1500, 1500, 1500, 1500, 0, 0, 0, 0
+        )
+    except Exception as e:
+        pass
+
+def detect_and_align(master, model, stream_url):
+    cap = cv2.VideoCapture(stream_url)
+    reconnect_attempts = 0
+
+    while cap.isOpened():
+        try:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                reconnect_attempts += 1
+                if reconnect_attempts > 3:
+                    loiter(master)
+                    break
+                time.sleep(1)
+                continue
+
+            reconnect_attempts = 0
+            try:
+                results = model.predict(source=frame, conf=0.7)
+                boxes = results[0].boxes
+                if boxes is None or boxes.xyxy.cpu().numpy().size == 0:
+                    continue
+            except Exception as e:
+                loiter(master)
+                break
+
+            frame_center = (frame.shape[1] // 2, frame.shape[0] // 2)
+            for box in boxes.xyxy.cpu().numpy():
+                obj_center_x = (box[0] + box[2]) / 2
+                obj_center_y = (box[1] + box[3]) / 2
+                offset_x = obj_center_x - frame_center[0]
+                offset_y = obj_center_y - frame_center[1]
+
+                roll = int(1500 + offset_x * 0.1)
+                pitch = int(1500 - offset_y * 0.1)
+
+                if master.target_system and master.target_component:
+                    master.mav.rc_channels_override_send(
+                        master.target_system,
+                        master.target_component,
+                        roll, pitch, 1500, 1500, 0, 0, 0, 0
+                    )
+                    print(f"Aligning: Roll={roll}, Pitch={pitch}")
+                else:
+                    loiter(master)
+                    break
+
+            cv2.imshow('YOLO Detection and Alignment', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        except Exception as e:
+            loiter(master)
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    connection_string = '/dev/ttyACM0'
+    stream_url = "http://192.168.43.1:81/stream"
+
+    try:
+        master = connect_to_drone(connection_string)
+
+        total_esc_calibration(master, auto_proceed=True)
+
+        model = YOLO('yolov8n.pt')
+
+        if not is_camera_accessible(stream_url):
+            if arm_and_takeoff(master, altitude=3):
+                simple_up_down(master, altitude=2, duration=10)
+            else:
+                loiter(master)
+        else:
+            if arm_and_takeoff(master, altitude=3):
+                detect_and_align(master, model, stream_url)
+            else:
+                loiter(master)
+
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            loiter(master)
+        except Exception:
+            pass
