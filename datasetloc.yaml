@@ -1,0 +1,5 @@
+train: /path/
+val: /path/
+test: /path/  # Optional, only if using a test set
+nc: 2  # Number of classes
+names: ['animal', 'tranquil_zone']
